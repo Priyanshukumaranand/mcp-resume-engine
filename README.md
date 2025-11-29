@@ -18,23 +18,37 @@ FastAPI backend plus Streamlit demo that stores and retrieves hackathon resumes 
 	pip install -r requirements.txt
 	```
 
+### Configure Gemini access
+Create a `.env` file (the backend loads it automatically) with your Google API key:
+
+```
+GEMINI_API_KEY=your_key_here
+# Optional override if you want a different Gemini model
+# GEMINI_MODEL_NAME=gemini-1.5-pro
+```
+
+By default the backend uses `gemini-1.5-flash`; update `GEMINI_MODEL_NAME` if you have access to another Gemini 3 series model.
+
 ## Running the FastAPI server
 ```bash
-uvicorn main:app --reload
+uvicorn backend.main:app --reload
 ```
 - The API listens on `http://127.0.0.1:8000` by default.
 - `POST /add_resume` accepts the full resume JSON payload.
 - `GET /resumes` lists everything currently in the `resumes` collection.
 - `DELETE /resumes/{resume_id}` removes a stored resume (Streamlit exposes a delete button per card).
 - `POST /recommend` runs semantic search + reranking and returns the best candidate, score, matching skills, and explanation.
+- `POST /qa` lets you ask natural-language questions about the uploaded resumes; it retrieves top matches and crafts an answer from their content.
+ - `POST /qa` now reranks the retrieved resumes with the cross-encoder and returns a concise summary that cites the top matches so you can trust the response.
 
 ## Streamlit demo app
 ```bash
-streamlit run streamlit_app.py
+streamlit run frontend/streamlit_app.py
 ```
 - Uses the same FastAPI URL (override with `API_BASE_URL`).
 - Upload a PDF resume; the app auto-extracts text for embedding and will infer preferred role/skills if you leave them blank.
-- Provides forms for uploading resumes and requesting recommendations.
+- Provides forms for uploading resumes, requesting recommendations, running the talent FAQ, and deleting outdated entries.
+- The "Ask about the resume pool" panel calls `/qa`, displays the synthesized answer, and lists the supporting resume snippets so you can verify the result.
 
 ## How ChromaDB fits in
 1. The API initializes a persistent ChromaDB client pointing at `./chroma_storage` and a collection named `resumes`.

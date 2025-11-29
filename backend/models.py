@@ -96,3 +96,31 @@ class RecommendationResult(BaseModel):
 class RecommendationResponse(BaseModel):
     best_match: RecommendationResult
     considered: int
+
+
+class QARequest(BaseModel):
+    question: str
+    top_k: int = Field(default=3, ge=1, le=10)
+
+    @field_validator("question", mode="before")
+    @classmethod
+    def _validate_question(cls, value: str) -> str:
+        if value is None:
+            raise ValueError("question is required")
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("question cannot be empty")
+        return trimmed
+
+
+class QASource(BaseModel):
+    id: str
+    name: str
+    role: Optional[str] = None
+    skills: List[str] = Field(default_factory=list)
+    summary: str
+
+
+class QAResponse(BaseModel):
+    answer: str
+    sources: List[QASource]

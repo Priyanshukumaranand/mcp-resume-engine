@@ -4,10 +4,16 @@ from typing import List, Sequence, Tuple, TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from embedder import ResumeEmbedder
-from models import RecommendationRequest, RecommendationResult, Resume
-from reranker import RecommendationRanker
-from vectorstore import ResumeVectorStore
+try:
+    from .embedder import ResumeEmbedder
+    from .models import RecommendationRequest, RecommendationResult, Resume
+    from .reranker import RecommendationRanker
+    from .vectorstore import ResumeVectorStore
+except ImportError:
+    from embedder import ResumeEmbedder  # type: ignore
+    from models import RecommendationRequest, RecommendationResult, Resume  # type: ignore
+    from reranker import RecommendationRanker  # type: ignore
+    from vectorstore import ResumeVectorStore  # type: ignore
 
 
 class AddResumeState(TypedDict, total=False):

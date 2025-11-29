@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 from uuid import uuid4
 
 import requests
@@ -11,21 +12,22 @@ API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 
 st.set_page_config(page_title="Hackathon Teammate Finder", layout="wide")
 st.title("Hackathon Teammate Finder Demo")
+st.caption(f"Talking to API at {API_BASE_URL}")
 
 
-def _post(path: str, payload: dict):
+def _post(path: str, payload: dict) -> Any:
     response = requests.post(f"{API_BASE_URL}{path}", json=payload, timeout=30)
     response.raise_for_status()
     return response.json()
 
 
-def _get(path: str):
+def _get(path: str) -> Any:
     response = requests.get(f"{API_BASE_URL}{path}", timeout=30)
     response.raise_for_status()
     return response.json()
 
 
-def _delete(path: str):
+def _delete(path: str) -> Any:
     response = requests.delete(f"{API_BASE_URL}{path}", timeout=30)
     response.raise_for_status()
     return response.json()
@@ -126,11 +128,13 @@ with st.expander("Find a teammate", expanded=True):
                 best = result["best_match"]
                 st.subheader("Best candidate")
                 st.write(best["candidate"])
-                st.write({
-                    "match_score": best["match_score"],
-                    "matching_skills": best["matching_skills"],
-                    "explanation": best["explanation"],
-                })
+                st.write(
+                    {
+                        "match_score": best["match_score"],
+                        "matching_skills": best["matching_skills"],
+                        "explanation": best["explanation"],
+                    }
+                )
             except requests.HTTPError as exc:
                 st.error(f"Failed: {exc.response.text}")
 
@@ -145,15 +149,33 @@ with st.expander("Stored resumes"):
                 with cols[0]:
                     st.write(resume)
                 with cols[1]:
-                    if st.button(
-                        "Delete",
-                        key=f"delete-{resume['id']}",
-                    ):
+                    if st.button("Delete", key=f"delete-{resume['id']}"):
                         try:
                             _delete(f"/resumes/{resume['id']}")
                             st.success(f"Deleted {resume['id']}")
-                            st.experimental_rerun()
+                            st.rerun()
                         except requests.HTTPError as exc:
                             st.error(f"Failed to delete: {exc.response.text}")
     except requests.HTTPError as exc:
         st.error(f"Could not load resumes: {exc.response.text}")
+
+with st.expander("Ask about the resume pool"):
+    with st.form("qa_form"):
+        question = st.text_input("Question", placeholder="Who has Python backend experience?")
+        qa_top_k = st.slider("Max resumes to inspect", 1, 10, 3)
+        submitted = st.form_submit_button("Ask")
+
+    if submitted:
+        if not question.strip():
+            st.error("Please enter a question.")
+        else:
+            try:
+                result = _post("/qa", {"question": question, "top_k": qa_top_k})
+                st.subheader("Answer")
+                st.write(result["answer"])
+                if result.get("sources"):
+                    st.caption("Sources")
+                    for source in result["sources"]:
+                        st.write(source)
+            except requests.HTTPError as exc:
+                st.error(f"Failed: {exc.response.text}")

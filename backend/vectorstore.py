@@ -6,7 +6,10 @@ from typing import List, Sequence
 
 import chromadb
 
-from models import RecommendationRequest, Resume
+try:
+    from .models import RecommendationRequest, Resume
+except ImportError:
+    from models import RecommendationRequest, Resume  # type: ignore
 
 
 class ResumeVectorStore:

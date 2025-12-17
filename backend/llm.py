@@ -23,7 +23,7 @@ class ResumeLLM:
         if not self.api_key:
             raise RuntimeError("GEMINI_API_KEY environment variable is required to use Gemini.")
         genai.configure(api_key=self.api_key)
-        self.model_name = model_name or os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash")
+        self.model_name = model_name or os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
         self._model: genai.GenerativeModel | None = None
 
     def _model_instance(self) -> genai.GenerativeModel:
@@ -84,19 +84,43 @@ class ResumeLLM:
 
         return "\n".join(fragments).strip()
 
-    def infer_role_and_skills(self, resume_text: str) -> Tuple[str | None, List[str]]:
+    def extract_resume_fields(self, resume_text: str) -> dict:
         text = (resume_text or "").strip()
         if not text:
-            return None, []
+            return {}
 
         prompt = (
-            "You are an assistant that extracts structured data from hackathon resumes. "
-            "Return compact JSON with keys 'role' (string) and 'skills' (array of unique lowercase strings).\n"
-            f"Resume text:\n{text}"
+            "Extract structured resume data as JSON with keys: "
+            "name (string), email (string), role (string), skills (array of lowercase strings), "
+            "summary (<=500 chars), experience (<=1500 chars). "
+            "Do not include contact headers or Markdown fences. Be concise.\n"
+            f"RESUME:\n{text}"
         )
         output = self._generate(prompt, max_output_tokens=256)
+        try:
+            data = json.loads(output)
+            if isinstance(data, dict):
+                return {
+                    "name": (str(data.get("name")) or "").strip(),
+                    "email": (str(data.get("email")) or "").strip(),
+                    "role": self._clean_role(data.get("role")),
+                    "skills": self._clean_skills(data.get("skills")),
+                    "summary": (str(data.get("summary")) or "").strip(),
+                    "experience": (str(data.get("experience")) or "").strip(),
+                }
+        except Exception:
+            pass
+
+        # Fallback: reuse role/skills parsing and keep the text as summary/experience
         role, skills = self._parse_response(output)
-        return role, skills
+        return {
+            "name": "",
+            "email": "",
+            "role": role,
+            "skills": skills,
+            "summary": text[:1500],
+            "experience": text[:1500],
+        }
 
     def answer_question(self, question: str, context: str) -> str:
         question = (question or "").strip()

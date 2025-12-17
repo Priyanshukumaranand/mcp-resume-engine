@@ -1,154 +1,156 @@
 from __future__ import annotations
 
-from typing import List, Sequence, Tuple, TypedDict
+from typing import List, TypedDict
 
 from langgraph.graph import END, StateGraph
 
 try:
     from .embedder import ResumeEmbedder
-    from .models import RecommendationRequest, RecommendationResult, Resume
-    from .reranker import RecommendationRanker
+    from .llm import ResumeLLM
+    from .models import Resume
     from .vectorstore import ResumeVectorStore
 except ImportError:
     from embedder import ResumeEmbedder  # type: ignore
-    from models import RecommendationRequest, RecommendationResult, Resume  # type: ignore
-    from reranker import RecommendationRanker  # type: ignore
+    from llm import ResumeLLM  # type: ignore
+    from models import Resume  # type: ignore
     from vectorstore import ResumeVectorStore  # type: ignore
 
 
 class AddResumeState(TypedDict, total=False):
     resume: Resume
-    document: str
-    embedding: List[float]
-
-
-class RecommendState(TypedDict, total=False):
-    request: RecommendationRequest
-    query_text: str
-    query_embedding: List[float]
-    candidates: List[Tuple[Resume, float]]
-    ranked: List[RecommendationResult]
+    chunks: List[str]
+    embeddings: List[List[float]]
 
 
 def build_add_resume_graph(embedder: ResumeEmbedder, store: ResumeVectorStore):
     graph = StateGraph(AddResumeState)
 
-    def build_document(state: AddResumeState):
-        document = store.build_document(state["resume"])
-        return {"document": document}
+    def chunk(state: AddResumeState):
+        document = _combine_fields(state["resume"])
+        chunks = _chunk_text(document)
+        return {"chunks": chunks}
 
     def embed(state: AddResumeState):
-        embedding = embedder.embed_text(state["document"])
-        return {"embedding": embedding}
+        embeddings = embedder.embed_many(state["chunks"])
+        return {"embeddings": embeddings}
 
     def persist(state: AddResumeState):
-        store.add_resume(state["resume"], state["embedding"], state["document"])
+        store.add_resume_chunks(state["resume"], state["embeddings"], state["chunks"])
         return {}
 
-    graph.add_node("build_document", build_document)
+    graph.add_node("chunk", chunk)
     graph.add_node("embed", embed)
     graph.add_node("persist", persist)
 
-    graph.set_entry_point("build_document")
-    graph.add_edge("build_document", "embed")
+    graph.set_entry_point("chunk")
+    graph.add_edge("chunk", "embed")
     graph.add_edge("embed", "persist")
     graph.add_edge("persist", END)
 
     return graph.compile()
 
 
-def build_recommendation_graph(
-    embedder: ResumeEmbedder,
-    store: ResumeVectorStore,
-    ranker: RecommendationRanker | None = None,
+class RefreshResumeState(TypedDict, total=False):
+    resume: Resume
+    extracted: dict
+    chunks: List[str]
+    embeddings: List[List[float]]
+
+
+def build_refresh_resume_graph(
+    resume_llm: ResumeLLM, embedder: ResumeEmbedder, store: ResumeVectorStore
 ):
-    graph = StateGraph(RecommendState)
+    graph = StateGraph(RefreshResumeState)
 
-    def build_query(state: RecommendState):
-        query_text = store.build_query_text(state["request"])
-        return {"query_text": query_text}
+    def extract(state: RefreshResumeState):
+        text = state.get("resume", {}).experience or state.get("resume", {}).summary or ""
+        extracted = resume_llm.extract_resume_fields(text) if text else {}
+        return {"extracted": extracted}
 
-    def embed_query(state: RecommendState):
-        embedding = embedder.embed_text(state["query_text"])
-        return {"query_embedding": embedding}
-
-    def search(state: RecommendState):
-        candidates = store.query(state["query_embedding"], top_k=state["request"].top_k)
-        return {"candidates": candidates}
-
-    def rerank(state: RecommendState):
-        ranked = _rerank_candidates(
-            candidates=state["candidates"],
-            request=state["request"],
-            query_text=state.get("query_text", ""),
-            store=store,
-            ranker=ranker,
+    def merge(state: RefreshResumeState):
+        resume = state["resume"]
+        data = state.get("extracted", {}) or {}
+        updated = Resume(
+            id=resume.id,
+            name=(data.get("name") or resume.name or "Unknown").strip(),
+            email=(data.get("email") or resume.email or "unknown@example.com").strip(),
+            role=(data.get("role") or resume.role),
+            skills=_deduplicate_skills(data.get("skills") or resume.skills),
+            experience=(data.get("experience") or resume.experience),
+            summary=(data.get("summary") or resume.summary),
         )
-        return {"ranked": ranked}
+        return {"resume": updated}
 
-    graph.add_node("build_query", build_query)
-    graph.add_node("embed_query", embed_query)
-    graph.add_node("search", search)
-    graph.add_node("rerank", rerank)
+    def chunk(state: RefreshResumeState):
+        document = _combine_fields(state["resume"])
+        chunks = _chunk_text(document)
+        return {"chunks": chunks}
 
-    graph.set_entry_point("build_query")
-    graph.add_edge("build_query", "embed_query")
-    graph.add_edge("embed_query", "search")
-    graph.add_edge("search", "rerank")
-    graph.add_edge("rerank", END)
+    def embed(state: RefreshResumeState):
+        embeddings = embedder.embed_many(state["chunks"])
+        return {"embeddings": embeddings}
+
+    def persist(state: RefreshResumeState):
+        store.delete(state["resume"].id)
+        store.add_resume_chunks(state["resume"], state["embeddings"], state["chunks"])
+        return {}
+
+    graph.add_node("extract", extract)
+    graph.add_node("merge", merge)
+    graph.add_node("chunk", chunk)
+    graph.add_node("embed", embed)
+    graph.add_node("persist", persist)
+
+    graph.set_entry_point("extract")
+    graph.add_edge("extract", "merge")
+    graph.add_edge("merge", "chunk")
+    graph.add_edge("chunk", "embed")
+    graph.add_edge("embed", "persist")
+    graph.add_edge("persist", END)
 
     return graph.compile()
 
 
-def _rerank_candidates(
-    candidates: Sequence[Tuple[Resume, float]],
-    request: RecommendationRequest,
-    query_text: str,
-    store: ResumeVectorStore,
-    ranker: RecommendationRanker | None = None,
-) -> List[RecommendationResult]:
-    request_skill_set = {skill.lower().strip() for skill in request.skills if skill.strip()}
-    ranked: List[RecommendationResult] = []
-
-    for resume, similarity in candidates:
-        candidate_skills = {skill.lower().strip(): skill for skill in resume.skills}
-        matches = [cand for key, cand in candidate_skills.items() if key in request_skill_set]
-        skill_score = (len(matches) / max(len(request_skill_set), 1)) if request_skill_set else 0
-        role_score = 0.0
-        if resume.role and resume.role.strip():
-            role_score = 1.0 if resume.role.lower() == request.role.lower() else 0.5 if request.role.lower() in resume.role.lower() else 0.0
-
-        cross_score = 0.0
-        if ranker is not None:
-            candidate_text = store.build_document(resume)
-            cross_score = ranker.score(query_text, candidate_text)
-
-        final_score = (
-            (similarity * 0.4)
-            + (skill_score * 0.25)
-            + (role_score * 0.1)
-            + (cross_score * 0.25)
-        )
-        explanation = _build_explanation(resume, final_score, matches, role_score)
-        ranked.append(
-            RecommendationResult(
-                candidate=resume,
-                match_score=round(final_score, 4),
-                matching_skills=matches,
-                explanation=explanation,
-            )
-        )
-
-    ranked.sort(key=lambda result: result.match_score, reverse=True)
-    return ranked
-
-
-def _build_explanation(
-    resume: Resume, score: float, matches: List[str], role_score: float
-) -> str:
+def _combine_fields(resume: Resume) -> str:
     parts = [
-        f"Score {score:.2f}",
-        f"role match: {'exact' if role_score == 1 else 'different'}",
-        f"skill overlap: {', '.join(matches) if matches else 'none'}",
+        resume.name,
+        resume.email,
+        resume.role or "",
+        ", ".join(resume.skills) if resume.skills else "",
+        resume.experience,
+        resume.summary,
     ]
-    return "; ".join(parts)
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _chunk_text(text: str, chunk_size: int = 800, overlap: int = 200) -> List[str]:
+    clean = (text or "").strip()
+    if not clean:
+        return []
+    chunks: List[str] = []
+    start = 0
+    while start < len(clean):
+        end = start + chunk_size
+        chunk = clean[start:end]
+        chunks.append(chunk)
+        if end >= len(clean):
+            break
+        start = end - overlap
+        if start < 0:
+            start = 0
+    return chunks
+
+
+def _deduplicate_skills(skills: List[str]) -> List[str]:
+    seen = set()
+    cleaned: List[str] = []
+    for skill in skills or []:
+        text = skill.strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        cleaned.append(text)
+    return cleaned[:10]

@@ -4,7 +4,7 @@ import os
 from uuid import uuid4
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,28 +20,42 @@ try:  # Support running as package or as a plain script
         QASource,
         Resume,
         ResumeListResponse,
+        ResumeResponse,
     )
     from .llm import ResumeLLM
     from .vectorstore import ResumeVectorStore
+    from .anonymizer import generate_anon_id, strip_pii, extract_email, UNKNOWN_VALUE
+    from .validator import ResponseValidator, FALLBACK_INSUFFICIENT_INFO
 except ImportError:
-    from embedder import ResumeEmbedder  # type: ignore
-    from graph import build_add_resume_graph, build_refresh_resume_graph  # type: ignore
-    from models import (  # type: ignore
+    from backend.embedder import ResumeEmbedder  # type: ignore
+    from backend.graph import build_add_resume_graph, build_refresh_resume_graph  # type: ignore
+    from backend.models import (  # type: ignore
         QARequest,
         QAResponse,
         QASource,
         Resume,
         ResumeListResponse,
+        ResumeResponse,
     )
-    from llm import ResumeLLM  # type: ignore
-    from vectorstore import ResumeVectorStore  # type: ignore
+    from backend.llm import ResumeLLM  # type: ignore
+    from backend.vectorstore import ResumeVectorStore  # type: ignore
+    from backend.anonymizer import generate_anon_id, strip_pii, extract_email, UNKNOWN_VALUE  # type: ignore
+    from backend.validator import ResponseValidator, FALLBACK_INSUFFICIENT_INFO  # type: ignore
 
 
-APP_NAME = "Hackathon Teammate Recommendation API"
+APP_NAME = "Privacy-First Resume Discovery API"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PERSIST_DIRECTORY = PROJECT_ROOT / "chroma_storage"
 
-app = FastAPI(title=APP_NAME, version="1.0.0")
+# Lowered confidence threshold for better response rate
+CONFIDENCE_THRESHOLD = 0.35
+
+app = FastAPI(
+    title=APP_NAME,
+    version="2.0.0",
+    description="Privacy-preserving student discovery API",
+)
+
 default_origins = (
     "https://ce-bootcamp.vercel.app,"
     "https://branchbase-backend.azurewebsites.net,"
@@ -66,9 +80,12 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=False,
 )
+
+# Initialize components
 embedder = ResumeEmbedder()
 vector_store = ResumeVectorStore(persist_directory=str(PERSIST_DIRECTORY))
 resume_llm = ResumeLLM()
+response_validator = ResponseValidator()
 add_resume_graph = build_add_resume_graph(embedder, vector_store)
 refresh_resume_graph = build_refresh_resume_graph(resume_llm, embedder, vector_store)
 
@@ -80,6 +97,18 @@ async def health() -> dict:
 
 @app.post("/ingest_pdf")
 async def ingest_pdf(file: UploadFile = File(...)) -> dict:
+    """
+    Ingest a PDF resume with full extraction pipeline.
+    
+    This is the single endpoint for processing resumes:
+    1. Extracts text from PDF
+    2. Strips PII (phone, URLs, addresses) - keeps name
+    3. Runs strict field extraction with source attribution
+    4. Generates stable anon_id from email
+    5. Chunks by section and stores with embeddings
+    
+    Returns complete extracted data for verification.
+    """
     if file.content_type not in {"application/pdf", "application/octet-stream"}:
         raise HTTPException(status_code=400, detail="Only PDF uploads are supported")
 
@@ -87,31 +116,71 @@ async def ingest_pdf(file: UploadFile = File(...)) -> dict:
     if not pdf_text:
         raise HTTPException(status_code=400, detail="Could not read any text from the PDF")
 
+    # Extract email for anon_id before stripping PII
+    email = extract_email(pdf_text) or UNKNOWN_VALUE
+    anon_id = generate_anon_id(email)
+    
+    # Strip phone, URLs, addresses from text (keep name)
+    sanitized_text = strip_pii(pdf_text)
+
+    # Run strict extraction
     try:
         extracted = resume_llm.extract_resume_fields(pdf_text) or {}
     except RuntimeError:
-        # Fallback: still ingest the text so RAG works even if Gemini extraction fails
-        extracted = {}
+        # Fallback: still ingest with basic data
+        extracted = {
+            "name": "Unknown",
+            "role": None,
+            "skills": [],
+            "projects": [],
+            "education": None,
+            "experience": sanitized_text[:1500],
+            "summary": sanitized_text[:500],
+        }
+
     resume = Resume(
         id=str(uuid4()),
+        anon_id=anon_id,
         name=extracted.get("name") or "Unknown",
-        email=extracted.get("email") or "unknown@example.com",
+        email=email,
         role=extracted.get("role"),
         skills=_deduplicate_skills(extracted.get("skills") or []),
-        experience=extracted.get("experience") or pdf_text,
-        summary=extracted.get("summary") or pdf_text[:1500],
+        projects=extracted.get("projects") or [],
+        education=extracted.get("education"),
+        experience=extracted.get("experience") or sanitized_text[:1500],
+        summary=extracted.get("summary") or sanitized_text[:500],
+        raw_text=sanitized_text,
     )
+    
     try:
         add_resume_graph.invoke({"resume": resume})
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return {"status": "created", "id": resume.id}
+    
+    # Return complete extracted data for verification
+    return {
+        "status": "processed",
+        "id": resume.id,
+        "anon_id": resume.anon_id,
+        "name": resume.name,
+        "role": resume.role,
+        "skills": resume.skills,
+        "projects": resume.projects,
+        "education": resume.education,
+        "summary": resume.summary[:300] if resume.summary else None,
+    }
 
 
 @app.get("/resumes", response_model=ResumeListResponse)
 async def list_resumes() -> ResumeListResponse:
+    """
+    List all resumes.
+    
+    Privacy: Email hidden, name visible.
+    """
     resumes = vector_store.get_all_resumes()
-    return ResumeListResponse(resumes=resumes)
+    response_resumes = [ResumeResponse.from_resume(r) for r in resumes]
+    return ResumeListResponse(resumes=response_resumes)
 
 
 @app.delete("/resumes/{resume_id}")
@@ -122,43 +191,105 @@ async def delete_resume(resume_id: str) -> dict:
     return {"status": "deleted", "id": resume_id}
 
 
-@app.post("/resumes/reextract")
-async def reextract_resumes() -> dict:
-    resumes = vector_store.get_all_resumes()
-    results = []
-    for resume in resumes:
-        try:
-            refresh_resume_graph.invoke({"resume": resume})
-            results.append({"id": resume.id, "status": "updated"})
-        except Exception as exc:
-            results.append({"id": resume.id, "status": "failed", "error": str(exc)[:200]})
-    return {"count": len(results), "results": results}
-
-
 @app.post("/qa", response_model=QAResponse)
 async def answer_question(request: QARequest) -> QAResponse:
+    """
+    Evidence-based QA with improved search.
+    
+    Features:
+    - Answers based on retrieved context
+    - Lowered confidence threshold for better response rate
+    - Falls back to rule-based answer when LLM fails
+    - Source sections and evidence snippets included
+    """
     if not vector_store.has_resumes():
         raise HTTPException(status_code=404, detail="No resumes stored")
 
     question = request.question.strip()
+    
+    # Increase top_k for better coverage
+    effective_top_k = max(request.top_k, 5)
     query_embedding = embedder.embed_text(question)
-    candidates = vector_store.query(query_embedding, top_k=request.top_k)
+    
+    # Get candidates with section metadata
+    candidates = vector_store.query(query_embedding, top_k=effective_top_k)
     if not candidates:
         raise HTTPException(status_code=404, detail="No relevant resumes found")
 
+    # Extract data for confidence calculation
+    similarities = [c[2] for c in candidates]
+    section_types = [c[3] for c in candidates]
+    chunks = [c[1] for c in candidates]
+    
+    # Calculate confidence - use max similarity as primary indicator
+    max_similarity = max(similarities) if similarities else 0
+    avg_similarity = sum(similarities) / len(similarities) if similarities else 0
+    confidence = (max_similarity * 0.7) + (avg_similarity * 0.3)
+    
+    # Build sources (name visible, email hidden)
     matches = _prepare_matches(candidates)
     sources = [_build_qa_source(match) for match in matches]
-    context = _build_qa_context(matches)
-    try:
-        answer = resume_llm.answer_question(question, context).strip()
-    except RuntimeError:
-        answer = ""
+    
+    # Get unique section types
+    unique_sections = list(set(section_types))
+    
+    # Evidence snippets from top matches
+    evidence_snippets = [m.chunk[:200] for m in matches[:3] if m.chunk]
+    
+    # Try to generate answer - be more permissive
+    is_fallback = False
+    answer = ""
+    
+    if confidence >= CONFIDENCE_THRESHOLD and matches:
+        # Build context and get LLM answer
+        context = _build_qa_context(matches)
+        try:
+            answer = resume_llm.answer_question(question, context).strip()
+        except RuntimeError:
+            answer = ""
 
-    if not answer or answer.lower() in {"i do not know", "i don't know"}:
+        # Check if answer is useful
+        if not answer or _is_unhelpful_answer(answer):
+            # Use rule-based answer instead of fallback
+            answer = _build_rule_based_answer(question, matches)
+            if answer:
+                is_fallback = False  # Rule-based is still useful
+            else:
+                answer = FALLBACK_INSUFFICIENT_INFO
+                is_fallback = True
+    else:
+        # Low confidence - try rule-based first
         answer = _build_rule_based_answer(question, matches)
-    if not answer:
-        answer = "I can't find out."
-    return QAResponse(answer=answer, sources=sources)
+        if answer:
+            is_fallback = False
+        else:
+            answer = FALLBACK_INSUFFICIENT_INFO
+            is_fallback = True
+    
+    return QAResponse(
+        answer=answer,
+        confidence_score=round(confidence, 3),
+        source_sections=unique_sections,
+        evidence_snippets=evidence_snippets,
+        sources=sources,
+        is_fallback=is_fallback,
+    )
+
+
+def _is_unhelpful_answer(answer: str) -> bool:
+    """Check if the LLM answer is unhelpful."""
+    unhelpful_phrases = {
+        "i do not know",
+        "i don't know",
+        "i can't find",
+        "i cannot find",
+        "insufficient information",
+        "no information",
+        "not found",
+        "not available",
+    }
+    answer_lower = answer.lower().strip()
+    return any(phrase in answer_lower for phrase in unhelpful_phrases)
 
 
 def _extract_pdf_text(upload: UploadFile) -> str:
@@ -181,7 +312,7 @@ def _extract_pdf_text(upload: UploadFile) -> str:
             texts.append(extracted.strip())
 
     combined = "\n\n".join(texts)
-    # Trim overly large payloads to keep embeddings reasonable
+    # Trim overly large payloads
     return combined[:20000]
 
 
@@ -197,7 +328,7 @@ def _deduplicate_skills(skills: list[str]) -> list[str]:
             continue
         seen.add(lowered)
         cleaned.append(text)
-    return cleaned[:10]
+    return cleaned[:15]
 
 
 @dataclass
@@ -205,12 +336,20 @@ class QAMatch:
     resume: Resume
     chunk: str
     similarity: float
+    section_type: str
 
 
-def _prepare_matches(candidates: List[tuple[Resume, str, float]]) -> List[QAMatch]:
+def _prepare_matches(candidates: List[tuple]) -> List[QAMatch]:
     matches: List[QAMatch] = []
-    for resume, chunk, similarity in candidates:
-        matches.append(QAMatch(resume=resume, chunk=chunk, similarity=similarity))
+    for item in candidates:
+        resume, chunk, similarity = item[0], item[1], item[2]
+        section_type = item[3] if len(item) > 3 else "unknown"
+        matches.append(QAMatch(
+            resume=resume,
+            chunk=chunk,
+            similarity=similarity,
+            section_type=section_type,
+        ))
     matches.sort(key=lambda match: match.similarity, reverse=True)
     return matches
 
@@ -220,7 +359,8 @@ def _build_qa_source(match: QAMatch) -> QASource:
     excerpt = (match.chunk or resume.summary or resume.experience)[:400]
     return QASource(
         id=resume.id,
-        name=resume.name,
+        anon_id=resume.anon_id,
+        name=resume.name,  # Name visible
         role=resume.role,
         skills=resume.skills,
         summary=excerpt,
@@ -232,33 +372,74 @@ def _build_qa_context(matches: List[QAMatch], limit: int = 5) -> str:
     for match in matches[:limit]:
         resume = match.resume
         parts = [
-            f"Name: {resume.name}",
-            f"Role: {resume.role or 'Unknown'}",
-            f"Skills: {', '.join(resume.skills) if resume.skills else 'None'}",
-            f"Summary: {resume.summary or resume.experience}",
-            f"Experience: {resume.experience}",
-            "FullDocument:",
-            match.chunk,
+            f"Candidate: {resume.name}",
+            f"Role: {resume.role or 'Not specified'}",
+            f"Skills: {', '.join(resume.skills) if resume.skills else 'Not listed'}",
+            f"Projects: {', '.join(resume.projects) if resume.projects else 'Not listed'}",
+            f"Education: {resume.education or 'Not provided'}",
+            f"Experience: {resume.experience[:500] if resume.experience else 'Not provided'}",
+            f"Summary: {resume.summary[:300] if resume.summary else 'Not provided'}",
         ]
         chunks.append("\n".join(parts))
-    return "\n---\n".join(chunks)
+    return "\n\n---\n\n".join(chunks)
 
 
 def _build_rule_based_answer(question: str, matches: List[QAMatch]) -> str:
+    """Build a rule-based answer from matched resumes."""
     if not matches:
         return ""
 
-    top = matches[0].resume
-    role = top.role or "Unknown role"
-    skills = ", ".join(top.skills[:5]) if top.skills else "no specific skills listed"
-    summary = (matches[0].chunk or top.summary or top.experience or "").strip()
-    if summary:
-        summary = summary[:320] + ("…" if len(summary) > 320 else "")
-
-    parts = [
-        f"Based on the stored resumes, {top.name} ({role}) seems most relevant to '{question}'.",
-        f"Key skills: {skills}.",
-    ]
-    if summary:
-        parts.append(f"Excerpt: {summary}")
-    return " ".join(parts).strip()
+    question_lower = question.lower()
+    
+    # Deduplicate by resume ID
+    seen_ids = set()
+    unique_matches = []
+    for m in matches:
+        if m.resume.id not in seen_ids:
+            seen_ids.add(m.resume.id)
+            unique_matches.append(m)
+    
+    if not unique_matches:
+        return ""
+    
+    top = unique_matches[0]
+    resume = top.resume
+    
+    # Build answer based on question type
+    if any(word in question_lower for word in ["experience", "work", "job", "role"]):
+        exp = resume.experience[:400] if resume.experience else resume.summary[:400]
+        return f"{resume.name} has the following experience: {exp}"
+    
+    elif any(word in question_lower for word in ["skill", "technology", "tech", "know"]):
+        if resume.skills:
+            return f"{resume.name} has these skills: {', '.join(resume.skills)}"
+        else:
+            return f"Based on {resume.name}'s resume: {resume.summary[:300]}"
+    
+    elif any(word in question_lower for word in ["project", "built", "created", "developed"]):
+        if resume.projects:
+            return f"{resume.name} has worked on these projects: {', '.join(resume.projects)}"
+        else:
+            return f"From {resume.name}'s experience: {resume.experience[:300] if resume.experience else resume.summary[:300]}"
+    
+    elif any(word in question_lower for word in ["education", "degree", "university", "college", "study"]):
+        if resume.education:
+            return f"{resume.name}'s education: {resume.education}"
+        else:
+            return f"Education information for {resume.name} is not explicitly listed."
+    
+    elif any(word in question_lower for word in ["who", "find", "candidate"]):
+        # General candidate search
+        parts = [f"{resume.name}"]
+        if resume.role:
+            parts.append(f"({resume.role})")
+        if resume.skills:
+            parts.append(f"with skills in {', '.join(resume.skills[:5])}")
+        return f"Best match: {' '.join(parts)}. {resume.summary[:200] if resume.summary else ''}"
+    
+    else:
+        # Default: return summary
+        role = resume.role or "professional"
+        skills = ", ".join(resume.skills[:5]) if resume.skills else "various skills"
+        summary = resume.summary[:250] if resume.summary else resume.experience[:250]
+        return f"{resume.name} is a {role} with {skills}. {summary}"

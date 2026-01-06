@@ -67,8 +67,6 @@ uvicorn backend.main:app --reload
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/ingest_pdf` | Upload resume PDF |
-| `GET` | `/resumes` | List all resumes |
-| `DELETE` | `/resumes/{id}` | Delete a resume |
 | `POST` | `/qa` | Ask questions |
 | `GET` | `/health` | Health check |
 

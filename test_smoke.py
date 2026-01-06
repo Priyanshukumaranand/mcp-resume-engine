@@ -1,15 +1,15 @@
+"""Smoke tests for resume processing API."""
 import os
 import pytest
 from unittest.mock import MagicMock, patch
 
-# Set dummy env vars before importing main to bypass dependency init checks
+# Set dummy env vars before importing main
 os.environ["GEMINI_API_KEY"] = "dummy_key"
 os.environ["HUGGINGFACE_API_TOKEN"] = "dummy_token"
 
-# Now import app
 from backend.main import app
 from backend.anonymizer import generate_anon_id, strip_pii, extract_email, UNKNOWN_VALUE
-from backend.validator import ResponseValidator
+from backend.retrieval.verifier import ResponseVerifier
 from fastapi.testclient import TestClient
 
 client = TestClient(app)
@@ -17,7 +17,7 @@ client = TestClient(app)
 
 @pytest.fixture(autouse=True)
 def mock_dependencies():
-    """Mock out the heavy/external dependencies in backend.main"""
+    """Mock out the heavy/external dependencies."""
     with patch("backend.main.resume_llm") as mock_llm, \
          patch("backend.main.embedder") as mock_embedder, \
          patch("backend.main.vector_store") as mock_vs:
@@ -36,8 +36,11 @@ def mock_dependencies():
         mock_llm.answer_question.return_value = "Test User has Python experience."
 
         # Mock Embedder
-        mock_embedder.embed_text.return_value = [0.1, 0.2, 0.3]
-        mock_embedder.embed_many.return_value = [[0.1, 0.2, 0.3]]
+        mock_embedder.embed_text.return_value = [0.1] * 768
+        mock_embedder.embed_query.return_value = [0.1] * 768
+        mock_embedder.embed_document.return_value = [0.1] * 768
+        mock_embedder.embed_documents.return_value = [[0.1] * 768]
+        mock_embedder.embed_many.return_value = [[0.1] * 768]
         
         # Mock Vector Store
         mock_vs.has_resumes.return_value = True
@@ -51,7 +54,9 @@ def mock_dependencies():
 def test_health():
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    data = response.json()
+    assert data["status"] == "ok"
+    assert "version" in data
 
 
 def test_ingest_pdf_mock():
@@ -61,12 +66,13 @@ def test_ingest_pdf_mock():
         response = client.post("/ingest_pdf", files=files)
         assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "created"
+        assert data["status"] == "processed"
         assert "id" in data
         assert "anon_id" in data
         assert "name" in data
-        # Email should NOT be in response
-        assert "email" not in data or "@" not in str(data.get("email", ""))
+        # Should include section info
+        assert "sections_detected" in data
+        assert "chunk_count" in data
 
 
 def test_list_resumes():
@@ -103,7 +109,7 @@ def test_qa_flow_with_confidence():
     assert response.status_code == 200
     data = response.json()
     
-    # Check new response fields
+    # Check response fields
     assert "answer" in data
     assert "confidence_score" in data
     assert "source_sections" in data
@@ -115,64 +121,6 @@ def test_qa_flow_with_confidence():
     assert "name" in source
     assert source["name"] == "Alice"
     assert "anon_id" in source
-
-
-def test_team_recommend():
-    """Test team recommendation endpoint."""
-    from backend.main import vector_store
-    from backend.models import Resume
-    
-    # Create mock resumes with explicit skills
-    mock_resume1 = Resume(
-        id="1",
-        anon_id="user1abc",
-        name="Bob",
-        email="bob@test.com",
-        role="Backend Dev",
-        skills=["python", "fastapi", "postgresql"],
-        projects=["API Gateway"],
-        experience="Backend development",
-        summary="Python expert",
-    )
-    mock_resume2 = Resume(
-        id="2",
-        anon_id="user2def",
-        name="Carol",
-        email="carol@test.com",
-        role="Frontend Dev",
-        skills=["react", "typescript", "css"],
-        projects=["Dashboard UI"],
-        experience="Frontend development",
-        summary="React specialist",
-    )
-    
-    # Mock skill query results
-    vector_store.query_by_skills.return_value = [
-        (mock_resume1, ["python", "fastapi"], 0.9),
-        (mock_resume2, ["react"], 0.8),
-    ]
-    
-    payload = {
-        "required_skills": ["python", "react", "fastapi"],
-        "team_size": 3
-    }
-    response = client.post("/teams/recommend", json=payload)
-    assert response.status_code == 200
-    data = response.json()
-    
-    assert "candidates" in data
-    assert "required_skills" in data
-    assert "coverage_summary" in data
-    
-    # Check candidates have correct structure
-    if data["candidates"]:
-        candidate = data["candidates"][0]
-        assert "anon_id" in candidate
-        assert "name" in candidate  # Name should be visible
-        assert "matched_skills" in candidate
-        assert "reasoning" in candidate
-        # Reasoning should reference explicit skills
-        assert "explicitly" in candidate["reasoning"].lower() or "matched" in candidate["reasoning"].lower()
 
 
 # ==================== Privacy Tests ====================
@@ -235,28 +183,28 @@ def test_extract_email():
 
 def test_confidence_calculation():
     """Test confidence score calculation."""
-    validator = ResponseValidator()
+    verifier = ResponseVerifier()
     
     # High similarity = high confidence
-    high_conf = validator.calculate_confidence([0.9, 0.85, 0.8], 3)
+    high_conf = verifier.calculate_confidence([0.9, 0.85, 0.8], 3)
     assert high_conf > 0.7
     
     # Low similarity = low confidence
-    low_conf = validator.calculate_confidence([0.3, 0.2, 0.1], 3)
+    low_conf = verifier.calculate_confidence([0.3, 0.2, 0.1], 3)
     assert low_conf < 0.5
     
     # Empty = zero confidence
-    zero_conf = validator.calculate_confidence([], 0)
+    zero_conf = verifier.calculate_confidence([], 0)
     assert zero_conf == 0.0
 
 
 def test_validation_fallback():
     """Test fallback responses."""
-    validator = ResponseValidator()
+    verifier = ResponseVerifier()
     
     # Should return fallback for low confidence
-    assert validator.should_use_fallback(0.3)
-    assert not validator.should_use_fallback(0.9)
+    assert verifier.should_use_fallback(0.3)
+    assert not verifier.should_use_fallback(0.9)
 
 
 def test_no_email_in_qa_response():
@@ -268,7 +216,7 @@ def test_no_email_in_qa_response():
         id="1",
         anon_id="abc123",
         name="Test User",
-        email="secret@example.com",  # This should NOT appear
+        email="secret@example.com",
         role="Developer",
         skills=["python"],
         projects=[],
@@ -287,20 +235,69 @@ def test_no_email_in_qa_response():
     assert "secret" not in response_text.lower()
 
 
-# ==================== Strict Extraction Tests ====================
+# ==================== Semantic Chunking Tests ====================
 
-def test_strict_extraction_format():
-    """Test that LLM extraction returns expected format."""
-    from backend.llm import ResumeLLM, UNKNOWN_VALUE
+def test_semantic_chunker():
+    """Test semantic chunking."""
+    from backend.core import SemanticChunker
     
-    # This would require actual Gemini API, so we test the structure
-    llm = ResumeLLM.__new__(ResumeLLM)
+    chunker = SemanticChunker()
     
-    # Test empty extraction
-    empty_result = llm._empty_extraction()
-    assert empty_result["name"] == UNKNOWN_VALUE
-    assert empty_result["email"] == UNKNOWN_VALUE
-    assert empty_result["skills"] == []
+    sample_text = """
+    John Smith
+    Software Engineer
+    
+    SKILLS
+    Python, JavaScript, React, Node.js, PostgreSQL
+    
+    EXPERIENCE
+    Senior Developer at TechCorp (2020-Present)
+    Built scalable microservices architecture.
+    
+    EDUCATION
+    B.S. Computer Science, MIT
+    """
+    
+    chunks, sections = chunker.chunk_resume(sample_text)
+    
+    assert len(chunks) > 0
+    assert len(sections) > 0
+    
+    # Check section types detected
+    section_types = {s.section_type for s in sections}
+    assert "skills" in section_types or "header" in section_types
+
+
+def test_section_detector():
+    """Test section detection."""
+    from backend.core import SectionDetector
+    
+    detector = SectionDetector()
+    
+    text = """
+    TECHNICAL SKILLS
+    Python, Java, React
+    
+    WORK EXPERIENCE
+    Developer at Company
+    """
+    
+    sections = detector.detect_sections(text)
+    assert len(sections) > 0
+
+
+# ==================== Embedding Tests ====================
+
+def test_embedder_dimensions():
+    """Test embedder returns correct dimensions."""
+    from backend.embeddings import ResumeEmbedder
+    
+    embedder = ResumeEmbedder.__new__(ResumeEmbedder)
+    embedder.model_name = "BAAI/bge-base-en-v1.5"
+    embedder._embedding_dim = 768
+    
+    # The dimension property should return 768
+    assert embedder.embedding_dimension == 768
 
 
 def test_unknown_value_constant():

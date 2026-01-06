@@ -172,7 +172,6 @@ class ResumeLLM:
         
         try:
             output = self._generate(prompt, max_output_tokens=1024)
-            # Clean potential markdown code fences
             output = self._clean_json_output(output)
             data = json.loads(output)
             
@@ -183,7 +182,6 @@ class ResumeLLM:
         except Exception:
             pass
 
-        # Fallback: basic extraction without strict validation
         return self._fallback_extraction(text)
 
     def extract_resume_fields(self, resume_text: str) -> dict:
@@ -248,8 +246,8 @@ class ResumeLLM:
             "name": name,
             "email": self._validate_email_field(data.get("email"), raw_text),
             "role": self._validate_sourced_field(data.get("role"), raw_text),
-            "skills": self._validate_sourced_list(data.get("skills"), raw_text),
-            "projects": self._validate_sourced_list(data.get("projects"), raw_text),
+            "skills": self._validate_sourced_list(data.get("skills"), raw_text, lenient=True),
+            "projects": self._validate_sourced_list(data.get("projects"), raw_text, lenient=True),
             "education": self._validate_sourced_field(data.get("education"), raw_text),
             "experience": self._validate_sourced_list(data.get("experience"), raw_text),
             "summary": str(data.get("summary", ""))[:500],
@@ -322,9 +320,15 @@ class ResumeLLM:
         return {"value": UNKNOWN_VALUE, "source_span": None}
 
     def _validate_sourced_list(
-        self, items: Any, raw_text: str
+        self, items: Any, raw_text: str, lenient: bool = False
     ) -> List[Dict[str, Any]]:
-        """Validate list of fields with source attribution."""
+        """Validate list of fields with source attribution.
+        
+        Args:
+            items: List of items to validate
+            raw_text: Original resume text for verification
+            lenient: If True, accept items even if not found in text (for skills)
+        """
         if not items or not isinstance(items, list):
             return []
         
@@ -333,20 +337,29 @@ class ResumeLLM:
         
         for item in items:
             if isinstance(item, str):
-                if item.lower() in raw_lower:
-                    validated.append({"value": item, "source_span": item})
+                value = item.strip()
+                if not value or value == UNKNOWN_VALUE:
+                    continue
+                # Check if in text, or accept if lenient mode
+                if value.lower() in raw_lower:
+                    validated.append({"value": value, "source_span": value})
+                elif lenient and len(value) > 1:
+                    # In lenient mode, accept skills that look valid
+                    validated.append({"value": value, "source_span": None})
             elif isinstance(item, dict):
-                value = str(item.get("value", ""))
+                value = str(item.get("value", "")).strip()
                 source = item.get("source_span")
                 
                 if not value or value == UNKNOWN_VALUE:
                     continue
                 
-                # Verify in text
+                # Verify in text or accept if lenient
                 if source and str(source).lower() in raw_lower:
                     validated.append({"value": value, "source_span": str(source)})
                 elif value.lower() in raw_lower:
                     validated.append({"value": value, "source_span": value})
+                elif lenient and len(value) > 1:
+                    validated.append({"value": value, "source_span": None})
         
         return validated
 

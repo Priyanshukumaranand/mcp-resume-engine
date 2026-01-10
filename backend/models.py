@@ -166,6 +166,7 @@ class ResumeResponse(BaseModel):
 class QARequest(BaseModel):
     question: str
     top_k: int = Field(default=3, ge=1, le=10)
+    use_multihop: bool = Field(default=False, description="Enable multihop retrieval for complex queries")
 
     @field_validator("question", mode="before")
     @classmethod

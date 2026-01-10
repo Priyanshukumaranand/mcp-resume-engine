@@ -11,6 +11,14 @@ google-generativeai>=0.5.0
 langgraph>=0.2.35
 huggingface_hub>=1.2.3
 
+# LangChain for embeddings (HuggingFace Inference API)
+langchain>=0.3.0
+langchain-huggingface>=0.1.0
+
+# Queue Infrastructure
+redis>=5.0.0
+rq>=1.16.0
+
 # Utilities
 python-dotenv>=1.0.0
 python-multipart>=0.0.6

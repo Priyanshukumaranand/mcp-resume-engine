@@ -1,38 +1,41 @@
 """High-quality embeddings for resume search and retrieval.
 
-Uses BAAI/bge-base-en-v1.5 for improved semantic understanding.
-Supports instruction-based embedding for query vs document differentiation.
+Uses HuggingFace Inference API for embeddings - lightweight, no local model downloads.
 """
 from __future__ import annotations
 
-import math
 import os
 import re
 from typing import Iterable, List, Optional
 
-from huggingface_hub import InferenceClient
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 
 
 class ResumeEmbedder:
-    """Resume embedder with instruction-based embedding support.
+    """Resume embedder using HuggingFace Inference API.
     
-    Uses BGE (BAAI General Embedding) model which supports:
-    - Asymmetric retrieval (query vs document differentiation)
-    - Better performance on MTEB benchmarks
-    - 768 dimensions for richer semantic representation
+    Uses MiniLM (all-MiniLM-L6-v2) via HuggingFace API which provides:
+    - No large model downloads
+    - Fast API-based inference
+    - 384 dimensions
+    
+    Requires HUGGINGFACE_API_TOKEN environment variable.
     
     Attributes:
         model_name: HuggingFace model identifier
-        query_prefix: Instruction prefix for query embeddings
-        document_prefix: Instruction prefix for document embeddings
+        embedding_dimension: Vector dimension size
     """
     
-    # Default model with excellent retrieval performance
-    DEFAULT_MODEL = "BAAI/bge-base-en-v1.5"
+    # Default model - fast and effective for semantic search
+    DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
     
-    # Instruction prefixes for asymmetric retrieval
-    QUERY_PREFIX = "Represent this sentence for retrieving relevant resume passages: "
-    DOCUMENT_PREFIX = ""  # BGE documents don't need prefix
+    # Model dimensions lookup
+    MODEL_DIMS = {
+        "sentence-transformers/all-MiniLM-L6-v2": 384,
+        "sentence-transformers/all-mpnet-base-v2": 768,
+        "BAAI/bge-base-en-v1.5": 768,
+        "BAAI/bge-small-en-v1.5": 384,
+    }
     
     def __init__(
         self,
@@ -43,30 +46,22 @@ class ResumeEmbedder:
         
         Args:
             model_name: Model to use for embeddings
-            use_instruction_prefix: Whether to use instruction prefix for queries
+            use_instruction_prefix: Kept for API compatibility
         """
         self.model_name = model_name or self.DEFAULT_MODEL
         self.use_instruction_prefix = use_instruction_prefix
         
-        token = os.getenv("HUGGINGFACE_API_TOKEN")
-        if not token:
-            raise RuntimeError("HUGGINGFACE_API_TOKEN is required for embeddings")
+        # Get API token
+        api_token = os.getenv("HUGGINGFACE_API_TOKEN") or os.getenv("HF_TOKEN")
         
-        self.client = InferenceClient(token=token)
+        # Initialize with HuggingFace Inference API
+        self._model = HuggingFaceEndpointEmbeddings(
+            model=self.model_name,
+            huggingfacehub_api_token=api_token,
+        )
         
-        # Determine embedding dimension based on model
-        self._embedding_dim = self._get_embedding_dimension()
-    
-    def _get_embedding_dimension(self) -> int:
-        """Get embedding dimension for the model."""
-        model_dims = {
-            "BAAI/bge-base-en-v1.5": 768,
-            "BAAI/bge-large-en-v1.5": 1024,
-            "BAAI/bge-small-en-v1.5": 384,
-            "sentence-transformers/all-MiniLM-L6-v2": 384,
-            "sentence-transformers/all-mpnet-base-v2": 768,
-        }
-        return model_dims.get(self.model_name, 768)
+        # Get embedding dimension
+        self._embedding_dim = self.MODEL_DIMS.get(self.model_name, 384)
     
     @property
     def embedding_dimension(self) -> int:
@@ -74,10 +69,7 @@ class ResumeEmbedder:
         return self._embedding_dim
     
     def embed_query(self, query: str) -> List[float]:
-        """Embed a search query with instruction prefix.
-        
-        For asymmetric retrieval, queries should be prefixed
-        to improve retrieval accuracy.
+        """Embed a search query.
         
         Args:
             query: Search query text
@@ -88,19 +80,26 @@ class ResumeEmbedder:
         if not query:
             return [0.0] * self._embedding_dim
         
-        # Clean and prepare query
         clean_query = self._prepare_text(query)
         
-        # Add instruction prefix for query
-        if self.use_instruction_prefix:
-            clean_query = self.QUERY_PREFIX + clean_query
+        # Retry logic for API failures
+        import time
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = self._model.embed_query(clean_query)
+                if result and len(result) > 0:
+                    return result
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1)  # Wait before retry
+                    continue
+                raise RuntimeError(f"Embedding API failed after {max_retries} attempts: {e}")
         
-        return self.embed_text(clean_query)
+        return [0.0] * self._embedding_dim
     
     def embed_document(self, text: str) -> List[float]:
         """Embed a document chunk.
-        
-        Documents don't need instruction prefix for BGE models.
         
         Args:
             text: Document text to embed
@@ -111,14 +110,23 @@ class ResumeEmbedder:
         if not text:
             return [0.0] * self._embedding_dim
         
-        # Clean and prepare document text
         clean_text = self._prepare_text(text)
         
-        # Add document prefix if using instruction-based model
-        if self.use_instruction_prefix and self.DOCUMENT_PREFIX:
-            clean_text = self.DOCUMENT_PREFIX + clean_text
+        # Retry logic for API failures
+        import time
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = self._model.embed_query(clean_text)
+                if result and len(result) > 0:
+                    return result
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                raise RuntimeError(f"Embedding API failed after {max_retries} attempts: {e}")
         
-        return self.embed_text(clean_text)
+        return [0.0] * self._embedding_dim
     
     def embed_text(self, text: str) -> List[float]:
         """Embed a single text string.
@@ -129,10 +137,7 @@ class ResumeEmbedder:
         Returns:
             Normalized embedding vector
         """
-        if not text:
-            return [0.0] * self._embedding_dim
-        
-        return self.embed_many([text])[0]
+        return self.embed_document(text)
     
     def embed_many(self, texts: Iterable[str]) -> List[List[float]]:
         """Embed multiple texts in batch.
@@ -147,24 +152,7 @@ class ResumeEmbedder:
         if not items:
             return []
         
-        try:
-            result = self.client.feature_extraction(
-                items,
-                model=self.model_name,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Embedding API failed: {exc}") from exc
-        
-        if result is None:
-            raise RuntimeError("Embedding API returned no data")
-        
-        # Convert to list of lists
-        vectors = result.tolist() if hasattr(result, "tolist") else result
-        if not isinstance(vectors, list) or not vectors:
-            raise RuntimeError("Unexpected embedding response shape")
-        
-        # Normalize all vectors
-        return [self._normalize(vec) for vec in vectors]
+        return self._model.embed_documents(items)
     
     def embed_documents(self, texts: Iterable[str]) -> List[List[float]]:
         """Embed multiple documents.
@@ -181,14 +169,8 @@ class ResumeEmbedder:
         if not items:
             return []
         
-        # Prepare each document
         prepared = [self._prepare_text(t) for t in items]
-        
-        # Add document prefix if needed
-        if self.use_instruction_prefix and self.DOCUMENT_PREFIX:
-            prepared = [self.DOCUMENT_PREFIX + t for t in prepared]
-        
-        return self.embed_many(prepared)
+        return self._model.embed_documents(prepared)
     
     def _prepare_text(self, text: str) -> str:
         """Prepare text for embedding.
@@ -205,30 +187,17 @@ class ResumeEmbedder:
         text = re.sub(r'[^\w\s]{10,}', '', text)
         
         # Truncate if too long (most models have 512 token limit)
-        # Approximate with 4 chars per token
         max_chars = 2000
         if len(text) > max_chars:
             text = text[:max_chars]
         
         return text
-    
-    @staticmethod
-    def _normalize(vector: List[float]) -> List[float]:
-        """L2 normalize a vector.
-        
-        Normalized vectors enable cosine similarity via dot product.
-        """
-        magnitude = math.sqrt(sum(float(v) ** 2 for v in vector))
-        if not magnitude:
-            return [float(v) for v in vector]
-        return [float(v) / magnitude for v in vector]
 
 
 class QueryExpander:
     """Expands queries for improved retrieval.
     
     Uses simple heuristics to add related terms.
-    Could be extended with LLM-based expansion.
     """
     
     # Common skill synonyms for expansion
@@ -261,7 +230,6 @@ class QueryExpander:
         
         for term, synonyms in cls.SKILL_SYNONYMS.items():
             if term in query_lower:
-                # Add synonyms
                 expansions.extend(synonyms)
         
         if expansions:

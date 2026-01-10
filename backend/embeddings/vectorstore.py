@@ -46,7 +46,7 @@ class ResumeVectorStore:
     def __init__(
         self,
         persist_directory: str,
-        collection_name: str = "resumes_v2",
+        collection_name: str = "resumes_v3",
     ) -> None:
         """Initialize vector store.
         

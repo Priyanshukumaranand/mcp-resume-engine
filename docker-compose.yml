@@ -1,0 +1,75 @@
+
+# Resume Discovery API with Redis Queue
+# ======================================
+# This setup provides:
+# - FastAPI server for handling requests
+# - Redis for job queue
+# - N workers for processing Gemini API calls (no rate limits!)
+#
+# Usage:
+#   docker-compose up -d
+#   docker-compose logs -f worker  # Watch worker processing
+#   docker-compose up --scale worker=5  # Run 5 workers
+
+services:
+  # FastAPI Application Server
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - HUGGINGFACE_API_TOKEN=${HUGGINGFACE_API_TOKEN:-}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-*}
+    volumes:
+      - chroma_data:/app/chroma_storage
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Redis for Job Queue
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Background Worker for Gemini API calls
+  # Scale this to control concurrency: docker-compose up --scale worker=5
+  worker:
+    build: .
+    command: python -m backend.queue.worker
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - HUGGINGFACE_API_TOKEN=${HUGGINGFACE_API_TOKEN:-}
+    volumes:
+      - chroma_data:/app/chroma_storage
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      # Default: 5 workers = safe concurrency for Gemini
+      # Adjust based on your Gemini API rate limits
+      replicas: 5
+    restart: unless-stopped
+
+volumes:
+  chroma_data:
+    driver: local
+  redis_data:
+    driver: local

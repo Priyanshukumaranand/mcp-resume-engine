@@ -11,9 +11,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-RUN pip install --upgrade pip==23.3.1 \
-    && rm -rf /root/.cache/pip
-RUN pip install --no-cache-dir -r requirements.txt \
+RUN pip install --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt \
     && rm -rf /root/.cache/pip
 
 FROM python:3.11-slim
